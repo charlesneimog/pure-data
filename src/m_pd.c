@@ -327,7 +327,7 @@ void pd_init(void)
     pd_init_systems();
 }
 
-EXTERN void pd_init_systems(void) {
+void pd_init_systems(void) {
     mess_init();
     sys_lock();
     obj_init();
@@ -337,12 +337,12 @@ EXTERN void pd_init_systems(void) {
     sys_unlock();
 }
 
-EXTERN void pd_term_systems(void) {
+void pd_term_systems(void) {
     sys_lock();
     sys_unlock();
 }
 
-EXTERN t_canvas *pd_getcanvaslist(void)
+t_canvas *pd_getcanvaslist(void)
 {
     return (pd_this->pd_canvaslist);
 }
