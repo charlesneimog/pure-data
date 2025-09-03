@@ -15,7 +15,6 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -23,76 +22,17 @@
 #include <spa/param/param.h>
 
 #include "m_private_utils.h"
+#include "s_audio_paring.h"
 
-/* ------------------------ Simple interleaved-float SPSC ringbuffer ------------------------ */
-typedef struct {
-    float *buf;           /* interleaved samples */
-    size_t cap;           /* total samples (frames * channels) */
-    _Atomic size_t r;     /* read position in frames */
-    _Atomic size_t w;     /* write position in frames */
-} rb_t;
+/* enable thread signaling instead of polling (like JACK backend) */
+#if 1
+#define THREADSIGNAL
+#endif
 
-static void rb_init(rb_t *rb, size_t frames_cap, int channels)
-{
-    rb->cap = frames_cap * (size_t)channels;
-    rb->buf = (float *)calloc(rb->cap, sizeof(float));
-    atomic_store(&rb->r, 0);
-    atomic_store(&rb->w, 0);
-}
-static void rb_free(rb_t *rb)
-{
-    free(rb->buf);
-    rb->buf = NULL;
-    rb->cap = 0;
-}
-static size_t rb_read(rb_t *rb, float *dst, size_t frames, int channels)
-{
-    if (!rb->buf || rb->cap == 0) return 0;
-    size_t cap_frames = rb->cap / (size_t)channels;
-    size_t r = atomic_load_explicit(&rb->r, memory_order_relaxed);
-    size_t w = atomic_load_explicit(&rb->w, memory_order_acquire);
-    size_t avail = (w + cap_frames - r) % cap_frames;
-    size_t todo = frames < avail ? frames : avail;
-    if (todo == 0) return 0;
-
-    size_t idx_frames = r % cap_frames;
-    size_t end_frames = cap_frames - idx_frames;
-    size_t c1 = todo < end_frames ? todo : end_frames;
-
-    memcpy(dst, rb->buf + (idx_frames * channels), c1 * (size_t)channels * sizeof(float));
-    if (todo > c1) {
-        memcpy(dst + c1 * channels, rb->buf, (todo - c1) * (size_t)channels * sizeof(float));
-    }
-    atomic_store_explicit(&rb->r, (r + todo) % cap_frames, memory_order_release);
-    return todo;
-}
-static size_t rb_write(rb_t *rb, const float *src, size_t frames, int channels)
-{
-    if (!rb->buf || rb->cap == 0) return 0;
-    size_t cap_frames = rb->cap / (size_t)channels;
-    size_t r = atomic_load_explicit(&rb->r, memory_order_acquire);
-    size_t w = atomic_load_explicit(&rb->w, memory_order_relaxed);
-    size_t freef = (r + cap_frames - w) % cap_frames;
-    if (freef == 0) freef = cap_frames;
-    if (freef == cap_frames) freef--; /* keep one slot free */
-    size_t todo = frames < freef ? frames : freef;
-    if (todo == 0) return 0;
-
-    size_t idx_frames = w % cap_frames;
-    size_t end_frames = cap_frames - idx_frames;
-    size_t c1 = todo < end_frames ? todo : end_frames;
-
-    memcpy(rb->buf + (idx_frames * channels), src, c1 * (size_t)channels * sizeof(float));
-    if (todo > c1) {
-        memcpy(rb->buf, src + c1 * channels, (todo - c1) * (size_t)channels * sizeof(float));
-    }
-    atomic_store_explicit(&rb->w, (w + todo) % cap_frames, memory_order_release);
-    return todo;
-}
+#define MAX_BUFFERS 4
+#define MAX_ALLOCA_SAMPLES  (16*1024)
 
 /* ------------------------------- Backend state ------------------------------- */
-#define MAX_BUFFERS 4
-
 typedef struct _pw_state {
     int samplerate;
     int blocksize;
@@ -102,6 +42,8 @@ typedef struct _pw_state {
     unsigned in_channels;
     unsigned out_channels;
 
+    unsigned desired_block;
+
     struct pw_thread_loop *tloop;
     struct pw_stream *stream_in;
     struct pw_stream *stream_out;
@@ -109,38 +51,29 @@ typedef struct _pw_state {
     struct spa_hook stream_in_listener;
     struct spa_hook stream_out_listener;
 
-    rb_t rb_in;                  /* PW -> Pd ring (capture)  [interleaved float] */
-    rb_t rb_out;                 /* Pd -> PW ring (playback) [interleaved float] */
+    /* sys_ringbuf-based FIFOs (interleaved t_sample audio) */
+    sys_ringbuf inring;         /* PW -> Pd */
+    sys_ringbuf outring;        /* Pd -> PW */
+    char *inbuf;                /* backing storage for inring */
+    char *outbuf;               /* backing storage for outring */
 
-    float *tmp_in;               /* interleaved temp for deinterleave to Pd */
-    size_t tmp_in_cap;           /* frames capacity for tmp_in */
-    float *tmp_out;              /* interleaved temp for interleave from Pd */
-    size_t tmp_out_cap;          /* frames capacity for tmp_out */
-
-    unsigned desired_block;      /* as requested by Pd (blocksize) */
-    int in_printed_match_once;
-    int in_printed_mismatch_once;
-    int out_printed_match_once;
-    int out_printed_mismatch_once;
+#ifdef THREADSIGNAL
+    t_semaphore *sem;           /* wake Pd scheduler when audio thread has work */
+#endif
 
     int running;
+    volatile int dio_error;     /* set on over/underruns */
 } t_pw_state;
 
 static t_pw_state pw_state;
 static int pw_inited = 0;
 
-
-/*
- * Pipewire input callbacks, for now we just use pw_in_process
-*/
+/* ------------------ PipeWire callbacks ------------------ */
 static void pw_in_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
-    // This is called when, for example, in apps like pwvucontrol we change the
-    // input device.
-    logpost(0, 3, "Program in changed");
     (void)data; (void)id; (void)param;
+    logpost(0, PD_DEBUG, "[pipewire] input param changed");
 }
-
 
 static void pw_in_process(void *data)
 {
@@ -174,14 +107,18 @@ static void pw_in_process(void *data)
         return;
     }
 
-    const float *src = (const float *)((const char *)base + chunk_offset);
-    uint32_t stride = st->in_channels * sizeof(float);
-    uint32_t nframes = stride ? (uint32_t)(nbytes / stride) : 0;
+    const void *src = (const char *)base + chunk_offset;
 
-    if (nframes > 0 && st->in_channels > 0) {
-        rb_write(&st->rb_in, src, nframes, (int)st->in_channels);
+    /* Write interleaved float/t_sample bytes into input ring */
+    long written = sys_ringbuf_write(&st->inring, src, (long)nbytes, st->inbuf);
+    if (written < (long)nbytes) {
+        /* overflow: drop tail */
+        st->dio_error = 1;
     }
 
+#ifdef THREADSIGNAL
+    if (st->sem) sys_semaphore_post(st->sem);
+#endif
     pw_stream_queue_buffer(st->stream_in, b);
 }
 
@@ -191,17 +128,11 @@ static const struct pw_stream_events stream_in_events = {
     .process       = pw_in_process,
 };
 
-/*
- * Pipewire output callbacks, for now we just use pw_in_process
-*/
 static void pw_out_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
-    // This is called when, for example, in apps like pwvucontrol we change the
-    // output device.
-    logpost(0, 3, "Program out changed");
     (void)data; (void)id; (void)param;
+    logpost(0, PD_DEBUG, "[pipewire] output param changed");
 }
-
 
 static void pw_out_process(void *data)
 {
@@ -217,42 +148,26 @@ static void pw_out_process(void *data)
         return;
     }
 
-    float *dst = (float *)buf->datas[0].data;
+    char *dst = (char *)buf->datas[0].data;
     uint32_t max_bytes = buf->datas[0].maxsize;
-    uint32_t stride = st->out_channels * sizeof(float);
-    uint32_t nframes = stride ? (max_bytes / stride) : 0;
 
-    /* One-time notice on quantum */
-    // if (nframes > 0) {
-    //     if (nframes == st->desired_block) {
-    //         if (!st->out_printed_match_once) {
-    //             post("[pipewire] playback server honoured requested blocksize: %u", nframes);
-    //             st->out_printed_match_once = 1;
-    //         }
-    //     } else if (!st->out_printed_mismatch_once) {
-    //         post("[pipewire] playback requested %u but server provides %u frames",
-    //              st->desired_block, nframes);
-    //         st->out_printed_mismatch_once = 1;
-    //     }
-    // }
-
-    if (nframes == 0 || st->out_channels == 0) {
-        pw_stream_queue_buffer(st->stream_out, b);
-        return;
-    }
-
-    size_t got = rb_read(&st->rb_out, dst, nframes, (int)st->out_channels);
-    if (got < nframes) {
+    /* read interleaved bytes from output ring */
+    long got = sys_ringbuf_read(&st->outring, dst, (long)max_bytes, st->outbuf);
+    if (got < (long)max_bytes) {
         /* underrun: zero remainder */
-        memset(dst + got * st->out_channels, 0,
-               (nframes - (uint32_t)got) * st->out_channels * sizeof(float));
+        memset(dst + got, 0, (size_t)max_bytes - (size_t)got);
+        st->dio_error = 1;
     }
 
     if (buf->datas[0].chunk) {
         buf->datas[0].chunk->offset = 0;
-        buf->datas[0].chunk->stride = stride;
-        buf->datas[0].chunk->size   = nframes * stride;
+        buf->datas[0].chunk->stride = (int)st->out_channels * (int)sizeof(t_sample);
+        buf->datas[0].chunk->size   = max_bytes;
     }
+
+#ifdef THREADSIGNAL
+    if (st->sem) sys_semaphore_post(st->sem);
+#endif
     pw_stream_queue_buffer(st->stream_out, b);
 }
 
@@ -262,11 +177,9 @@ static const struct pw_stream_events stream_out_events = {
     .process       = pw_out_process,
 };
 
-
 /* -------------------------- Helpers: make/conn streams -------------------------- */
 static int pw_make_capture_stream(t_pw_state *st)
 {
-    /* properties to request blocksize/rate */
     unsigned sr = (unsigned)(st->samplerate > 0 ? st->samplerate : 48000);
 
     char rate_prop[32];
@@ -320,7 +233,7 @@ static int pw_make_capture_stream(t_pw_state *st)
 
     /* 3) buffers sized for one block */
     int frames     = st->blocksize;
-    int stride     = (int)st->in_channels * (int)sizeof(float);
+    int stride     = (int)st->in_channels * (int)sizeof(t_sample);
     int size_bytes = frames * stride;
 
     params[n_params++] = spa_pod_builder_add_object(
@@ -395,7 +308,7 @@ static int pw_make_playback_stream(t_pw_state *st)
 
     /* 3) buffers sized for one block */
     int frames     = st->blocksize;
-    int stride     = (int)st->out_channels * (int)sizeof(float);
+    int stride     = (int)st->out_channels * (int)sizeof(t_sample);
     int size_bytes = frames * stride;
 
     params[n_params++] = spa_pod_builder_add_object(
@@ -415,20 +328,17 @@ static int pw_make_playback_stream(t_pw_state *st)
     return 0;
 }
 
-
 /* ------------------------------ Backend API ------------------------------ */
-/*
- * Open a single PipeWire client (thread loop) with up to one capture and one
- * playback stream. Channels are totals across requested devices. We request
- * a quantum equal to Pd's blocksize and verify on first callbacks.
- */
+/* ... same includes and state as your current file ... */
+
+/* ... same includes and state as your current file ... */
+
 int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     int *chindev, int naudiooutdev, int *audiooutdev, int nchoutdev,
     int *choutdev, int rate, int blocksize)
 {
     (void)audioindev; (void)audiooutdev; (void)nchindev; (void)nchoutdev;
 
-    /* Sum channels from device channel arrays (if provided) */
     unsigned in_ch = 0, out_ch = 0;
     if (chindev && naudioindev > 0)
         for (int i = 0; i < naudioindev; i++)
@@ -437,7 +347,6 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
         for (int i = 0; i < naudiooutdev; i++)
             out_ch += (unsigned)((choutdev[i] > 0) ? choutdev[i] : 0);
 
-    /* Initialize PipeWire once per process */
     if (!pw_inited) {
         pw_init(NULL, NULL);
         pw_inited = 1;
@@ -452,37 +361,63 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     pw_state.in_channels   = in_ch;
     pw_state.out_channels  = out_ch;
 
-    /* Create one thread loop (single client) */
+#ifdef THREADSIGNAL
+    pw_state.sem = sys_semaphore_create();
+#endif
+
     pw_state.tloop = pw_thread_loop_new("pd-pipewire", NULL);
     if (!pw_state.tloop) {
-        logpost(0, 1, "[pipewire] failed to create thread loop");
+        logpost(0, PD_NORMAL, "[pipewire] failed to create thread loop");
         goto fail;
     }
     if (pw_thread_loop_start(pw_state.tloop) != 0) {
-        logpost(0, 1, "[pipewire] failed to start thread loop");
+        logpost(0, PD_NORMAL, "[pipewire] failed to start thread loop");
         goto fail;
     }
 
-    /* Hold loop while creating/connecting streams */
     pw_thread_loop_lock(pw_state.tloop);
 
-    /* Create rings (16 Pd blocks of capacity by default) */
-    if (pw_state.in_channels > 0)
-        rb_init(&pw_state.rb_in,  (size_t)pw_state.blocksize * 16, (int)pw_state.in_channels);
-    if (pw_state.out_channels > 0)
-        rb_init(&pw_state.rb_out, (size_t)pw_state.blocksize * 16, (int)pw_state.out_channels);
+    /* compute advance_samples and align to blocksize */
+    int advance_samples = (int)(sys_schedadvance * (double)rate / 1.e6);
+    if (DEFDACBLKSIZE > 0)
+        advance_samples -= (advance_samples % DEFDACBLKSIZE);
+    if (advance_samples < blocksize)
+        advance_samples = blocksize;
 
-    /* Build streams as requested; either/both may be zero channels */
+    /* Create sys_ringbufs with backing buffers.
+       IMPORTANT: use pw_state.{in,out}_channels here and sizes in BYTES. */
+    if (pw_state.in_channels > 0) {
+        long insize_bytes = (long)sizeof(t_sample) *
+                            (long)pw_state.in_channels *
+                            (long)advance_samples;
+        pw_state.inbuf = (char *)malloc((size_t)insize_bytes);
+        if (!pw_state.inbuf) { pw_thread_loop_unlock(pw_state.tloop); goto fail; }
+
+        /* start empty; if you want to prefill, memset to 0 and pass insize_bytes as 4th arg */
+        sys_ringbuf_init(&pw_state.inring, insize_bytes, pw_state.inbuf, 0);
+    }
+
+    if (pw_state.out_channels > 0) {
+        long outsize_bytes = (long)sizeof(t_sample) *
+                             (long)pw_state.out_channels *
+                             (long)advance_samples;
+        pw_state.outbuf = (char *)malloc((size_t)outsize_bytes);
+        if (!pw_state.outbuf) { pw_thread_loop_unlock(pw_state.tloop); goto fail; }
+
+        /* start empty; last param must be BYTES (0 is safest) */
+        sys_ringbuf_init(&pw_state.outring, outsize_bytes, pw_state.outbuf, 0);
+    }
+
     if (pw_state.in_channels > 0) {
         if (pw_make_capture_stream(&pw_state) < 0) {
-            logpost(0, 1, "[pipewire] failed to create capture stream");
+            logpost(0, PD_NORMAL, "[pipewire] failed to create capture stream");
             pw_thread_loop_unlock(pw_state.tloop);
             goto fail;
         }
     }
     if (pw_state.out_channels > 0) {
         if (pw_make_playback_stream(&pw_state) < 0) {
-            logpost(0, 1, "[pipewire] failed to create playback stream");
+            logpost(0, PD_NORMAL, "[pipewire] failed to create playback stream");
             pw_thread_loop_unlock(pw_state.tloop);
             goto fail;
         }
@@ -490,39 +425,31 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     pw_thread_loop_unlock(pw_state.tloop);
 
     pw_state.running = 1;
+    pw_state.dio_error = 0;
     return 0;
 
 fail:
-    /* Clean up partial initialization */
     if (pw_state.tloop) {
-        pw_thread_loop_unlock(pw_state.tloop); /* in case still locked */
+        pw_thread_loop_unlock(pw_state.tloop);
         pw_thread_loop_stop(pw_state.tloop);
         pw_thread_loop_destroy(pw_state.tloop);
         pw_state.tloop = NULL;
     }
-    if (pw_state.stream_in) {
-        pw_stream_destroy(pw_state.stream_in);
-        pw_state.stream_in = NULL;
-    }
-    if (pw_state.stream_out) {
-        pw_stream_destroy(pw_state.stream_out);
-        pw_state.stream_out = NULL;
-    }
-    rb_free(&pw_state.rb_in);
-    rb_free(&pw_state.rb_out);
-    free(pw_state.tmp_in);  pw_state.tmp_in = NULL;  pw_state.tmp_in_cap = 0;
-    free(pw_state.tmp_out); pw_state.tmp_out = NULL; pw_state.tmp_out_cap = 0;
-
+    if (pw_state.stream_in) { pw_stream_destroy(pw_state.stream_in); pw_state.stream_in = NULL; }
+    if (pw_state.stream_out){ pw_stream_destroy(pw_state.stream_out); pw_state.stream_out = NULL; }
+#ifdef THREADSIGNAL
+    if (pw_state.sem) { sys_semaphore_destroy(pw_state.sem); pw_state.sem = NULL; }
+#endif
+    if (pw_state.inbuf)  { free(pw_state.inbuf);  pw_state.inbuf = NULL; }
+    if (pw_state.outbuf) { free(pw_state.outbuf); pw_state.outbuf = NULL; }
     pw_state.running = 0;
     return 1;
 }
 
 void pipewire_close_audio(void)
 {
-    if (!pw_state.tloop && !pw_state.stream_in && !pw_state.stream_out)
+    if (!pw_state.tloop && !pw_state.stream_in && !pw_state.stream_out && !pw_state.inbuf && !pw_state.outbuf)
         return;
-
-    // post("[pipewire] close");
 
     if (pw_state.tloop) {
         pw_thread_loop_lock(pw_state.tloop);
@@ -543,94 +470,63 @@ void pipewire_close_audio(void)
         pw_state.tloop = NULL;
     }
 
-    rb_free(&pw_state.rb_in);
-    rb_free(&pw_state.rb_out);
-    free(pw_state.tmp_in);  pw_state.tmp_in = NULL;  pw_state.tmp_in_cap = 0;
-    free(pw_state.tmp_out); pw_state.tmp_out = NULL; pw_state.tmp_out_cap = 0;
+#ifdef THREADSIGNAL
+    if (pw_state.sem) { sys_semaphore_destroy(pw_state.sem); pw_state.sem = NULL; }
+#endif
 
-    pw_state.in_printed_match_once = pw_state.in_printed_mismatch_once = 0;
-    pw_state.out_printed_match_once = pw_state.out_printed_mismatch_once = 0;
+    if (pw_state.inbuf) { free(pw_state.inbuf); pw_state.inbuf = NULL; }
+    if (pw_state.outbuf){ free(pw_state.outbuf); pw_state.outbuf = NULL; }
 
     pw_state.running = 0;
-
-    /* Keep pw_init() globally initialized; Pd may re-open later in same process. */
+    pw_state.dio_error = 0;
 }
 
-/* Called by Pd each DSP tick to move one block between Pd and PipeWire.
-   - Interleave Pd output (sys_soundout) and push to playback ring
-   - Pull from capture ring and deinterleave into sys_soundin
-   Returns nonzero when audio is active; zero if backend is stopped. */
+int sched_idletask(void);
+/* Move one Pd block between Pd and PipeWire using sys_ringbuf like JACK's polling mode. */
 int pipewire_send_dacs(void)
 {
     t_sample *muxbuffer;
     t_sample *fp, *fp2, *jp;
     int j, ch;
-    int retval = SENDDACS_YES;
-
-    /* backend inactive or no I/O channels -> nothing to do */
-    if (!pw_state.running || (!pw_state.in_channels && !pw_state.out_channels))
-        return SENDDACS_NO;
-
-    /* We use the Pd scheduler blocksize as the quantum to exchange */
-    const size_t frames = (size_t)DEFDACBLKSIZE;
-
-    /* Compute ring availability for one Pd block (in frames) */
-    /* Capture ring (PW -> Pd) */
-    size_t in_needed = (pw_state.in_channels ? frames : 0);
-    size_t in_avail = 0;
-    if (pw_state.in_channels) {
-        size_t cap_frames = pw_state.rb_in.cap / (size_t)pw_state.in_channels;
-        size_t r = atomic_load_explicit(&pw_state.rb_in.r, memory_order_relaxed);
-        size_t w = atomic_load_explicit(&pw_state.rb_in.w, memory_order_acquire);
-        in_avail = (w + cap_frames - r) % cap_frames;
-    }
-
-    /* Playback ring space (Pd -> PW) */
-    size_t out_needed = (pw_state.out_channels ? frames : 0);
-    size_t out_free = 0;
-    if (pw_state.out_channels) {
-        size_t cap_frames = pw_state.rb_out.cap / (size_t)pw_state.out_channels;
-        size_t r = atomic_load_explicit(&pw_state.rb_out.r, memory_order_acquire);
-        size_t w = atomic_load_explicit(&pw_state.rb_out.w, memory_order_relaxed);
-        out_free = (r + cap_frames - w) % cap_frames;
-        if (out_free == 0) out_free = cap_frames;
-        if (out_free == cap_frames) out_free--; /* keep one slot free, like rb_write */
-    }
-
-    /* If we cannot move a full Pd block, give scheduler a chance to do other work */
-#ifdef THREADSIGNAL
-    while ((pw_state.in_channels && in_avail < in_needed) ||
-           (pw_state.out_channels && out_free < out_needed))
-    {
-        if (sched_idletask())
-            continue; /* do other tasks first, then re-check */
-
-        /* No explicit semaphore used here; bail out like JACK's early return path */
-        return SENDDACS_NO;
-    }
-#else
-    if ((pw_state.in_channels && in_avail < in_needed) ||
-        (pw_state.out_channels && out_free < out_needed))
-        return SENDDACS_NO;
-#endif
-
-    /* Interleaving scratch buffer size in samples */
     const size_t muxbufsize =
         DEFDACBLKSIZE * (pw_state.in_channels > pw_state.out_channels ?
                          pw_state.in_channels : pw_state.out_channels);
+    int retval = SENDDACS_YES;
 
-    // #define MAX_ALLOCA_SAMPLES = 16 * 1024
-    int MAX_ALLOCA_SAMPLES = 16 * 1024;
+    if (!pw_state.running || (!pw_state.in_channels && !pw_state.out_channels))
+        return SENDDACS_NO;
+
+    /* compute required/available in bytes */
+    long need_in_bytes  = (long)pw_state.in_channels  * (long)DEFDACBLKSIZE * (long)sizeof(t_sample);
+    long need_out_bytes = (long)pw_state.out_channels * (long)DEFDACBLKSIZE * (long)sizeof(t_sample);
+
+    while (
+        (pw_state.in_channels  && sys_ringbuf_getreadavailable(&pw_state.inring)  < need_in_bytes) ||
+        (pw_state.out_channels && sys_ringbuf_getwriteavailable(&pw_state.outring) < need_out_bytes))
+    {
+#ifdef THREADSIGNAL
+        if (sched_idletask())
+            continue;
+        if (pw_state.sem)
+            sys_semaphore_wait(pw_state.sem);
+        retval = SENDDACS_SLEPT;
+#else
+        return SENDDACS_NO;
+#endif
+    }
+
+    if (pw_state.dio_error) {
+        /* log a resync like JACK backend does */
+        sys_log_error(ERR_RESYNC);
+        pw_state.dio_error = 0;
+    }
+
     ALLOCA(t_sample, muxbuffer, muxbufsize, MAX_ALLOCA_SAMPLES);
 
-    /* De-mux capture into STUFF->st_soundin (channel-major, blocklength DEFDACBLKSIZE) */
+    /* Input: de-interleave from ring to STUFF->st_soundin */
     if (pw_state.in_channels)
     {
-        /* Read one Pd block as interleaved frames from PW->Pd ring */
-        /* rb_read expects float buffer; Pd's t_sample is float in typical builds.
-           If t_sample were double, a separate temp and conversion would be needed. */
-        rb_read(&pw_state.rb_in, (float *)muxbuffer, frames, (int)pw_state.in_channels);
-
+        sys_ringbuf_read(&pw_state.inring, muxbuffer, need_in_bytes, pw_state.inbuf);
         for (fp = muxbuffer, ch = 0; ch < (int)pw_state.in_channels; ch++, fp++)
         {
             jp = STUFF->st_soundin + ch * DEFDACBLKSIZE;
@@ -642,7 +538,7 @@ int pipewire_send_dacs(void)
         }
     }
 
-    /* Mux playback from STUFF->st_soundout and push to Pd->PW ring */
+    /* Output: interleave from STUFF->st_soundout to ring */
     if (pw_state.out_channels)
     {
         for (fp = muxbuffer, ch = 0; ch < (int)pw_state.out_channels; ch++, fp++)
@@ -654,13 +550,13 @@ int pipewire_send_dacs(void)
                 *fp2 = jp[j];
             }
         }
-        rb_write(&pw_state.rb_out, (const float *)muxbuffer, frames, (int)pw_state.out_channels);
+        sys_ringbuf_write(&pw_state.outring, muxbuffer, need_out_bytes, pw_state.outbuf);
     }
 
-    /* Clear Pd's output buffer for the next block, like the JACK backend does */
+    /* clear Pd's output buffer for next block (as in JACK backend) */
     if (pw_state.out_channels && STUFF->st_soundout)
         memset(STUFF->st_soundout, 0,
-               DEFDACBLKSIZE * (size_t)pw_state.out_channels * sizeof(t_sample));
+               (size_t)DEFDACBLKSIZE * (size_t)pw_state.out_channels * sizeof(t_sample));
 
     FREEA(t_sample, muxbuffer, muxbufsize, MAX_ALLOCA_SAMPLES);
     return retval;
