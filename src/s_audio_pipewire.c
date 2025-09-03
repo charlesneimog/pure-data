@@ -7,7 +7,7 @@
 
 /* support for pipewire 0.3 by Charles K. Neimog <charlesneimog@outlook.com> */
 
-#include <alsa/asoundlib.h>
+#ifdef USEAPI_PIPEWIRE
 
 #include "m_pd.h"
 #include "s_stuff.h"
@@ -328,17 +328,16 @@ static int pw_make_playback_stream(t_pw_state *st)
     return 0;
 }
 
-/* ------------------------------ Backend API ------------------------------ */
-/* ... same includes and state as your current file ... */
-
-/* ... same includes and state as your current file ... */
-
 int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     int *chindev, int naudiooutdev, int *audiooutdev, int nchoutdev,
     int *choutdev, int rate, int blocksize)
 {
-    (void)audioindev; (void)audiooutdev; (void)nchindev; (void)nchoutdev;
+    if (!pw_inited) {
+        pw_init(NULL, NULL);
+        pw_inited = 1;
+    }
 
+    // count chs
     unsigned in_ch = 0, out_ch = 0;
     if (chindev && naudioindev > 0)
         for (int i = 0; i < naudioindev; i++)
@@ -347,11 +346,8 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
         for (int i = 0; i < naudiooutdev; i++)
             out_ch += (unsigned)((choutdev[i] > 0) ? choutdev[i] : 0);
 
-    if (!pw_inited) {
-        pw_init(NULL, NULL);
-        pw_inited = 1;
-    }
 
+    // configure
     memset(&pw_state, 0, sizeof(pw_state));
     pw_state.samplerate    = rate;
     pw_state.blocksize     = blocksize;
@@ -365,19 +361,19 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     pw_state.sem = sys_semaphore_create();
 #endif
 
-    pw_state.tloop = pw_thread_loop_new("pd-pipewire", NULL);
+    pw_state.tloop = pw_thread_loop_new("Pure Data", NULL);
     if (!pw_state.tloop) {
-        logpost(0, PD_NORMAL, "[pipewire] failed to create thread loop");
+        logpost(0, PD_CRITICAL, "pipewire failed to create thread loop");
         goto fail;
     }
     if (pw_thread_loop_start(pw_state.tloop) != 0) {
-        logpost(0, PD_NORMAL, "[pipewire] failed to start thread loop");
+        logpost(0, PD_CRITICAL, "[pipewire] failed to start thread loop");
         goto fail;
     }
 
     pw_thread_loop_lock(pw_state.tloop);
 
-    /* compute advance_samples and align to blocksize */
+    // compute advance_samples and align to blocksize
     int advance_samples = (int)(sys_schedadvance * (double)rate / 1.e6);
     if (DEFDACBLKSIZE > 0)
         advance_samples -= (advance_samples % DEFDACBLKSIZE);
@@ -387,37 +383,39 @@ int pipewire_open_audio(int naudioindev, int *audioindev, int nchindev,
     /* Create sys_ringbufs with backing buffers.
        IMPORTANT: use pw_state.{in,out}_channels here and sizes in BYTES. */
     if (pw_state.in_channels > 0) {
-        long insize_bytes = (long)sizeof(t_sample) *
-                            (long)pw_state.in_channels *
-                            (long)advance_samples;
-        pw_state.inbuf = (char *)malloc((size_t)insize_bytes);
-        if (!pw_state.inbuf) { pw_thread_loop_unlock(pw_state.tloop); goto fail; }
-
+        pw_state.inbuf = malloc(sizeof(t_sample) * STUFF->st_inchannels * advance_samples);
+        if (!pw_state.inbuf) {
+            pw_thread_loop_unlock(pw_state.tloop);
+            goto fail;
+        }
         /* start empty; if you want to prefill, memset to 0 and pass insize_bytes as 4th arg */
-        sys_ringbuf_init(&pw_state.inring, insize_bytes, pw_state.inbuf, 0);
+        sys_ringbuf_init(&pw_state.inring,
+            sizeof(t_sample) * STUFF->st_inchannels * advance_samples,
+                         pw_state.inbuf,
+                         sizeof(t_sample) * STUFF->st_inchannels * advance_samples);
     }
 
     if (pw_state.out_channels > 0) {
-        long outsize_bytes = (long)sizeof(t_sample) *
-                             (long)pw_state.out_channels *
-                             (long)advance_samples;
-        pw_state.outbuf = (char *)malloc((size_t)outsize_bytes);
-        if (!pw_state.outbuf) { pw_thread_loop_unlock(pw_state.tloop); goto fail; }
-
-        /* start empty; last param must be BYTES (0 is safest) */
-        sys_ringbuf_init(&pw_state.outring, outsize_bytes, pw_state.outbuf, 0);
+        pw_state.outbuf = malloc(sizeof(t_sample) * STUFF->st_outchannels * advance_samples);
+        if (!pw_state.outbuf) {
+            pw_thread_loop_unlock(pw_state.tloop);
+            goto fail;
+        }
+        sys_ringbuf_init(&pw_state.outring,
+            sizeof(t_sample) * STUFF->st_outchannels * advance_samples,
+                         pw_state.outbuf, 0);
     }
 
     if (pw_state.in_channels > 0) {
         if (pw_make_capture_stream(&pw_state) < 0) {
-            logpost(0, PD_NORMAL, "[pipewire] failed to create capture stream");
+            logpost(0, PD_CRITICAL, "[pipewire] failed to create capture stream");
             pw_thread_loop_unlock(pw_state.tloop);
             goto fail;
         }
     }
     if (pw_state.out_channels > 0) {
         if (pw_make_playback_stream(&pw_state) < 0) {
-            logpost(0, PD_NORMAL, "[pipewire] failed to create playback stream");
+            logpost(0, PD_CRITICAL, "[pipewire] failed to create playback stream");
             pw_thread_loop_unlock(pw_state.tloop);
             goto fail;
         }
@@ -435,13 +433,27 @@ fail:
         pw_thread_loop_destroy(pw_state.tloop);
         pw_state.tloop = NULL;
     }
-    if (pw_state.stream_in) { pw_stream_destroy(pw_state.stream_in); pw_state.stream_in = NULL; }
-    if (pw_state.stream_out){ pw_stream_destroy(pw_state.stream_out); pw_state.stream_out = NULL; }
+    if (pw_state.stream_in) {
+        pw_stream_destroy(pw_state.stream_in);
+        pw_state.stream_in = NULL;
+    }
+    if (pw_state.stream_out){
+        pw_stream_destroy(pw_state.stream_out);
+        pw_state.stream_out = NULL;
+    }
+
 #ifdef THREADSIGNAL
     if (pw_state.sem) { sys_semaphore_destroy(pw_state.sem); pw_state.sem = NULL; }
 #endif
-    if (pw_state.inbuf)  { free(pw_state.inbuf);  pw_state.inbuf = NULL; }
-    if (pw_state.outbuf) { free(pw_state.outbuf); pw_state.outbuf = NULL; }
+
+    if (pw_state.inbuf)  {
+        free(pw_state.inbuf);
+        pw_state.inbuf = NULL;
+    }
+    if (pw_state.outbuf) {
+        free(pw_state.outbuf);
+        pw_state.outbuf = NULL;
+    }
     pw_state.running = 0;
     return 1;
 }
@@ -471,14 +483,26 @@ void pipewire_close_audio(void)
     }
 
 #ifdef THREADSIGNAL
-    if (pw_state.sem) { sys_semaphore_destroy(pw_state.sem); pw_state.sem = NULL; }
+    if (pw_state.sem) {
+        sys_semaphore_destroy(pw_state.sem);
+        pw_state.sem = NULL;
+    }
 #endif
 
-    if (pw_state.inbuf) { free(pw_state.inbuf); pw_state.inbuf = NULL; }
-    if (pw_state.outbuf){ free(pw_state.outbuf); pw_state.outbuf = NULL; }
+    if (pw_state.inbuf) {
+        free(pw_state.inbuf);
+        pw_state.inbuf = NULL;
+    }
+    if (pw_state.outbuf){
+        free(pw_state.outbuf);
+        pw_state.outbuf = NULL;
+    }
 
     pw_state.running = 0;
     pw_state.dio_error = 0;
+
+    pw_deinit();
+    pw_inited = 0;
 }
 
 int sched_idletask(void);
@@ -562,11 +586,6 @@ int pipewire_send_dacs(void)
     return retval;
 }
 
-void pipewire_listdevs(void)
-{
-    post("device listing not implemented for pipewire yet\n");
-}
-
 void pipewire_getdevs(char *indevlist, int *nindevs,
     char *outdevlist, int *noutdevs, int *canmulti,
         int maxndev, int devdescsize)
@@ -576,8 +595,10 @@ void pipewire_getdevs(char *indevlist, int *nindevs,
     ndev = 1;
     for (i = 0; i < ndev; i++)
     {
-        sprintf(indevlist + i * devdescsize, "Pipewire");
-        sprintf(outdevlist + i * devdescsize, "Pipewire");
+        sprintf(indevlist + i * devdescsize, "PipeWire");
+        sprintf(outdevlist + i * devdescsize, "PipeWire");
     }
     *nindevs = *noutdevs = ndev;
 }
+#endif
+

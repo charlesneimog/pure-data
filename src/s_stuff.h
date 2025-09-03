@@ -130,6 +130,9 @@ typedef struct _audiosettings
 #elif defined(USEAPI_JACK)
 # define API_DEFAULT API_JACK
 # define API_DEFSTRING "Jack audio connection kit"
+#elif defined(USEAPI_PIPEWIRE)
+# define API_DEFAULT API_PIPEWIRE
+# define API_DEFSTRING "PipeWire"
 #elif defined(USEAPI_MMIO)
 # define API_DEFAULT API_MMIO
 # define API_DEFSTRING "MMIO"
